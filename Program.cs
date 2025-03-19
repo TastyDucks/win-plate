@@ -29,13 +29,19 @@ namespace VoskClient
             // Grammar for license plates + phonetic alphabet
             var grammar = new string[]
             {
-                "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-                "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
-                "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE"
+                // Alphanumerics
+                "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+                "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+                "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+                // NATO phonetic alphabet
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+                "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa",
+                "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey",
+                "x-ray", "yankee", "zulu",
             };
 
-            var grammarJson = JsonSerializer.Serialize(grammar);
-            var recognizer = new VoskRecognizer(model, 16000.0f);
+            var grammarJSON = JsonSerializer.Serialize(grammar);
+            var recognizer = new VoskRecognizer(model, 16000.0f, grammarJSON);
             recognizer.SetMaxAlternatives(3);
 
             var audioService = new AudioService();
@@ -50,6 +56,8 @@ namespace VoskClient
 
     public class AudioService
     {
+
+        
         public async Task StreamAudioAsync(VoskRecognizer recognizer)
         {
             var waveFormat = new WaveFormat(16000, 1);
