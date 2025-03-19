@@ -6,16 +6,129 @@ using System.Collections.Generic;
 using System.Text;
 using System.Text.Json;
 using System.Net.WebSockets;
+using System.Linq;
 using NAudio.Wave;
 using Vosk;
+using Supabase;
+using Supabase.Postgrest;
+using Supabase.Postgrest.Attributes;
+using Supabase.Postgrest.Models;
+using Supabase.Postgrest.Responses;
+using static Supabase.Postgrest.Constants;
 
 namespace VoskClient
 {
+    [Table("Sample_Plates_All_Fake_Data")]
+    public class VehicleInfo : BaseModel
+    {
+        [PrimaryKey("id")]
+        public int Id { get; set; }
+
+        [Column("plate")]
+        public string Plate { get; set; }
+
+        [Column("year")]
+        public int Year { get; set; }
+
+        [Column("make")]
+        public string Make { get; set; }
+
+        [Column("model")]
+        public string Model { get; set; }
+
+        [Column("status")]
+        public string Status { get; set; }
+
+        public override string ToString()
+        {
+            return $"Vehicle: {Year} {Make} {Model}, Plate: {Plate}, Status: {Status}";
+        }
+    }
+
+    // Service to handle API calls
+    public class VehicleApiService
+    {
+        public readonly Supabase.Client supabaseClient;
+
+        public VehicleApiService()
+        {
+            // Check for environment variables
+            var apiUrl = Environment.GetEnvironmentVariable("SUPABASE_API_URL");
+            var apiKey = Environment.GetEnvironmentVariable("SUPABASE_API_KEY");
+
+            if (string.IsNullOrEmpty(apiUrl) || string.IsNullOrEmpty(apiKey))
+            {
+                Console.WriteLine("[-] Warning: SUPABASE_API_URL or SUPABASE_API_KEY environment variables not set");
+            }
+            else
+            {
+                Console.WriteLine("[+] Supabase API configuration found");
+                var options = new SupabaseOptions
+                {
+                    AutoRefreshToken = true,
+                    AutoConnectRealtime = false
+                };
+                supabaseClient = new Supabase.Client(apiUrl, apiKey, options);
+            }
+        }
+
+        public async Task<VehicleInfo> GetVehicleInfoAsync(string plateNumber)
+        {
+            if (supabaseClient == null)
+            {
+                throw new InvalidOperationException("Supabase client not initialized. Check API URL and API Key configuration");
+            }
+
+            try
+            {
+                // Query using the Supabase SDK
+                Console.WriteLine($"[*] Querying plate: {plateNumber}");
+
+                var response = await supabaseClient
+                    .From<VehicleInfo>()
+                    .Filter(v => v.Plate, Operator.WFTS, new FullTextSearchConfig(plateNumber, "english"))
+                    .Get();
+                
+                if (response.Models.Count > 0)
+                {
+                    return response.Models.FirstOrDefault();
+                }
+                else
+                {
+                    Console.WriteLine($"[-] No vehicle found with plate {plateNumber}");
+                    return null;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[-] Error retrieving vehicle information: {ex.Message}");
+                return null;
+            }
+        }
+    }
+
     class Program
     {
         static async Task Main(string[] args)
         {
-            Console.WriteLine("[+] Vosk License Plate STT with WebSocket...");
+            Console.WriteLine("[+] Vosk License Plate STT...");
+
+            // Check environment variables
+            var supabaseUrl = Environment.GetEnvironmentVariable("SUPABASE_API_URL");
+            var supabaseKey = Environment.GetEnvironmentVariable("SUPABASE_API_KEY");
+            
+            Console.WriteLine($"[*] Supabase API URL configured: {!string.IsNullOrEmpty(supabaseUrl)}");
+            Console.WriteLine($"[*] Supabase API Key configured: {!string.IsNullOrEmpty(supabaseKey)}");
+
+            // Initialize API service
+            var apiService = new VehicleApiService();
+
+            // Print out all of the plate number we have
+            var everything = await apiService.supabaseClient.From<VehicleInfo>().Get();
+            foreach (var vehicle in everything.Models)
+            {
+                Console.WriteLine($"[*] Vehicle: {vehicle.Year} {vehicle.Make} {vehicle.Model}, Plate: {vehicle.Plate}, Status: {vehicle.Status}");
+            }
 
             const string modelPath = "vosk-model-small-en-us-0.15/";
 
@@ -30,24 +143,20 @@ namespace VoskClient
 
             var grammar = new string[]
             {
-                // TODO: I'm sure people are going to use other edge-cases like "one hundred" or "three sevens", what should be considered there?
                 "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
                 "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
                 "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
                 "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-                "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+                "india", "juliett", "kilo", "lima", "mike", "november", "oscar", "papa",
                 "quebec", "romeo", "sierra", "tango", "uniform", "victor", "whiskey",
-                "xray", "yankee", "zulu",
+                "x-ray", "yankee", "zulu",
             };
 
             var grammarJSON = JsonSerializer.Serialize(grammar);
             var recognizer = new VoskRecognizer(model, 16000.0f, grammarJSON);
             recognizer.SetMaxAlternatives(3);
 
-            var wsClient = new WebSocketClient("ws://localhost:8080/ws");
-            await wsClient.ConnectAsync();
-
-            var audioService = new AudioService(wsClient);
+            var audioService = new AudioService(apiService);
             Console.WriteLine("Press ENTER to start real-time capture...");
             Console.ReadLine();
             await audioService.StreamAudioAsync(recognizer);
@@ -59,11 +168,15 @@ namespace VoskClient
 
     public class AudioService
     {
-        private readonly WebSocketClient _ws;
+        private readonly VehicleApiService _apiService;
+        private readonly StringBuilder _plateBuilder = new StringBuilder();
+        private bool _isCollectingPlate = false;
+        private DateTime _lastCharTime = DateTime.MinValue;
+        private readonly TimeSpan _resetTimeout = TimeSpan.FromSeconds(3);
 
-        public AudioService(WebSocketClient ws)
+        public AudioService(VehicleApiService apiService)
         {
-            _ws = ws;
+            _apiService = apiService;
         }
 
         public async Task StreamAudioAsync(VoskRecognizer recognizer)
@@ -75,25 +188,25 @@ namespace VoskClient
                 BufferMilliseconds = 500
             };
 
-            // Optional: send start-of-stream message
-            await _ws.SendTextAsync(new { type = "audio_start" });
-
             waveIn.DataAvailable += async (s, a) =>
             {
-                // Stream raw audio PCM data (binary frames)
-                await _ws.SendBinaryAsync(a.Buffer, a.BytesRecorded);
-
                 // STT
                 if (recognizer.AcceptWaveform(a.Buffer, a.BytesRecorded))
                 {
                     var result = recognizer.Result();
                     Console.WriteLine("[+] Final: " + result);
-                    await _ws.SendTextAsync(new { type = "final", payload = JsonDocument.Parse(result) });
+                    
+                    // Parse the Vosk response and extract the highest confidence text
+                    string bestText = ExtractHighestConfidenceText(result);
+                    if (!string.IsNullOrEmpty(bestText))
+                    {
+                        await ProcessRecognizedText(bestText);
+                    }
+                    
                 }
                 else
                 {
                     var interim = recognizer.PartialResult();
-                    await _ws.SendTextAsync(new { type = "partial", payload = JsonDocument.Parse(interim) });
                 }
             };
 
@@ -101,108 +214,156 @@ namespace VoskClient
             Console.WriteLine("[*] Streaming... Press ENTER to stop.");
             await Task.Run(() => Console.ReadLine());
             waveIn.StopRecording();
-
-            // Send stop-of-stream indicator so server knows audio is complete
-            await _ws.SendTextAsync(new { type = "audio_end" });
-        }
-    }
-
-
-    public class WebSocketClient
-    {
-        private readonly ClientWebSocket _client;
-        private readonly Uri _uri;
-
-        public WebSocketClient(string url)
-        {
-            _client = new ClientWebSocket();
-            _uri = new Uri(url);
         }
 
-        public async Task ConnectAsync(int maxAttempts = 0, int retryIntervalMs = 2000, CancellationToken cancellationToken = default)
+        private string ExtractHighestConfidenceText(string voskJson)
         {
-            int attemptCount = 0;
-            bool connected = false;
-
-            Console.WriteLine($"[*] Attempting to connect to WebSocket at {_uri}...");
-            
-            while (!connected && (maxAttempts == 0 || attemptCount < maxAttempts) && !cancellationToken.IsCancellationRequested)
+            try
             {
-                try
+                using var document = JsonDocument.Parse(voskJson);
+                var root = document.RootElement;
+                
+                if (root.TryGetProperty("alternatives", out var alternatives))
                 {
-                    if (_client.State == WebSocketState.Aborted || _client.State == WebSocketState.Closed)
+                    // Direct structure from Vosk
+                    return GetBestAlternative(alternatives);
+                }
+                else if (root.TryGetProperty("payload", out var payload) && 
+                         payload.TryGetProperty("alternatives", out alternatives))
+                {
+                    // Nested structure that includes type
+                    return GetBestAlternative(alternatives);
+                }
+                
+                return null;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[-] Error parsing Vosk result: {ex.Message}");
+                return null;
+            }
+        }
+
+        private string GetBestAlternative(JsonElement alternatives)
+        {
+            if (alternatives.ValueKind != JsonValueKind.Array || alternatives.GetArrayLength() == 0)
+                return null;
+                
+            double bestConfidence = -1;
+            string bestText = null;
+            
+            foreach (var alt in alternatives.EnumerateArray())
+            {
+                if (alt.TryGetProperty("confidence", out var confElement) && 
+                    alt.TryGetProperty("text", out var textElement))
+                {
+                    double confidence = confElement.GetDouble();
+                    string text = textElement.GetString();
+                    
+                    if (confidence > bestConfidence)
                     {
-                        // Create a new client if previous one is in terminal state
-                        _client.Dispose();
-                        var newClient = new ClientWebSocket();
-                        typeof(WebSocketClient).GetField("_client", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                            ?.SetValue(this, newClient);
+                        bestConfidence = confidence;
+                        bestText = text;
                     }
-
-                    attemptCount++;
-                    Console.WriteLine($"[*] Connection attempt {attemptCount}" + (maxAttempts > 0 ? $" of {maxAttempts}..." : "..."));
-                    
-                    await _client.ConnectAsync(_uri, cancellationToken);
-                    connected = true;
-                    Console.WriteLine($"[+] Successfully connected to WebSocket after {attemptCount} attempt(s)!");
-                    
-                    // Start receive loop only when successfully connected
-                    _ = Task.Run(ReceiveLoop, cancellationToken);
                 }
-                catch (Exception ex)
+            }
+            
+            return bestText;
+        }
+
+        private async Task ProcessRecognizedText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+                return;
+                
+            // Check if we need to reset the plate collection due to timeout
+            if (_isCollectingPlate && (DateTime.Now - _lastCharTime) > _resetTimeout)
+            {
+                Console.WriteLine($"[*] Plate collection timeout. Resetting from: {_plateBuilder}");
+                _plateBuilder.Clear();
+                _isCollectingPlate = false;
+            }
+            
+            // Update last character time
+            _lastCharTime = DateTime.Now;
+            
+            // Normalize the recognized text to convert words to characters
+            string normalized = NormalizeText(text);
+            Console.WriteLine($"[*] Normalized input: '{text}' -> '{normalized}'");
+            
+            if (!string.IsNullOrEmpty(normalized))
+            {
+                _isCollectingPlate = true;
+                _plateBuilder.Append(normalized);
+                
+                // Only query when we have a reasonable plate length (typically 5-8 chars)
+                if (_plateBuilder.Length >= 5)
                 {
-                    Console.WriteLine($"[-] Connection attempt {attemptCount} failed: {ex.Message}");
+                    string plateToQuery = _plateBuilder.ToString();
                     
-                    if (maxAttempts > 0 && attemptCount >= maxAttempts)
+                    // Query the API
+                    var vehicleInfo = await _apiService.GetVehicleInfoAsync(plateToQuery);
+                    if (vehicleInfo != null)
                     {
-                        throw new Exception($"Failed to connect after {maxAttempts} attempts", ex);
+                        Console.WriteLine($"[*] Vehicle found: {vehicleInfo}");
+                        // Reset after successful lookup
+                        _plateBuilder.Clear();
+                        _isCollectingPlate = false;
                     }
-                    
-                    Console.WriteLine($"[*] Retrying in {retryIntervalMs}ms...");
-                    await Task.Delay(retryIntervalMs, cancellationToken);
+                    else
+                    {
+                        // Could be partial plate, continue collecting
+                        Console.WriteLine($"[*] No match for {plateToQuery}, continuing collection");
+                    }
+                }
+            }
+        }
+
+        private string NormalizeText(string text)
+        {
+            // Convert spoken digits and letters to actual characters
+            Dictionary<string, string> wordToChar = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                // Numbers
+                {"zero", "0"}, {"one", "1"}, {"two", "2"}, {"three", "3"}, {"four", "4"},
+                {"five", "5"}, {"six", "6"}, {"seven", "7"}, {"eight", "8"}, {"nine", "9"},
+                
+                // NATO phonetic alphabet
+                {"alpha", "A"}, {"bravo", "B"}, {"charlie", "C"}, {"delta", "D"}, 
+                {"echo", "E"}, {"foxtrot", "F"}, {"golf", "G"}, {"hotel", "H"},
+                {"india", "I"}, {"juliett", "J"}, {"juliet", "J"}, {"kilo", "K"}, 
+                {"lima", "L"}, {"mike", "M"}, {"november", "N"}, {"oscar", "O"}, 
+                {"papa", "P"}, {"quebec", "Q"}, {"romeo", "R"}, {"sierra", "S"}, 
+                {"tango", "T"}, {"uniform", "U"}, {"victor", "V"}, {"whiskey", "W"},
+                {"xray", "X"}, {"x-ray", "X"}, {"yankee", "Y"}, {"zulu", "Z"},
+                
+                // Single letters
+                {"a", "A"}, {"b", "B"}, {"c", "C"}, {"d", "D"}, {"e", "E"},
+                {"f", "F"}, {"g", "G"}, {"h", "H"}, {"i", "I"}, {"j", "J"},
+                {"k", "K"}, {"l", "L"}, {"m", "M"}, {"n", "N"}, {"o", "O"},
+                {"p", "P"}, {"q", "Q"}, {"r", "R"}, {"s", "S"}, {"t", "T"},
+                {"u", "U"}, {"v", "V"}, {"w", "W"}, {"x", "X"}, {"y", "Y"}, {"z", "Z"}
+            };
+
+            // Split the input text into individual words
+            string[] words = text.Trim().Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            StringBuilder normalizedText = new StringBuilder();
+            
+            foreach (string word in words)
+            {
+                if (wordToChar.TryGetValue(word, out string charValue))
+                {
+                    normalizedText.Append(charValue);
+                }
+                else
+                {
+                    // If not found in our mappings, keep the original word as-is
+                    // You could enhance this with custom logic for specific cases
+                    normalizedText.Append(word);
                 }
             }
             
-            if (cancellationToken.IsCancellationRequested)
-            {
-                Console.WriteLine("[!] Connection attempts cancelled");
-                throw new OperationCanceledException(cancellationToken);
-            }
-        }
-
-        public async Task SendTextAsync(object obj)
-        {
-            var json = JsonSerializer.Serialize(obj);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            await _client.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-        }
-
-        public async Task SendBinaryAsync(byte[] data, int length)
-        {
-            await _client.SendAsync(new ArraySegment<byte>(data, 0, length), WebSocketMessageType.Binary, true, CancellationToken.None);
-        }
-
-        private async Task ReceiveLoop()
-        {
-            var buffer = new byte[4096];
-            while (_client.State == WebSocketState.Open)
-            {
-                try
-                {
-                    var result = await _client.ReceiveAsync(new ArraySegment<byte>(buffer), CancellationToken.None);
-                    if (result.MessageType == WebSocketMessageType.Close) break;
-
-                    var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    Console.WriteLine("[<] Received: " + message);
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[-] Error in receive loop: {ex.Message}");
-                    break;
-                }
-            }
-            
-            Console.WriteLine($"[!] WebSocket connection closed. State: {_client.State}");
+            return normalizedText.ToString();
         }
     }
 }
